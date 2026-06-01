@@ -1,0 +1,226 @@
+// ==UserScript==
+// @name         Caelus Value Display
+// @namespace    http://tampermonkey.net/
+// @version      2.1
+// @description  Shows item value, demand, and trend on Caelus item and trade pages
+// @author       dax
+// @match        https://www.caelus.lol/catalog/*
+// @match        https://www.caelus.lol/trade/*
+// @grant        GM_xmlhttpRequest
+// @connect      pastebin.com
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const PASTEBIN_URL = "https://pastebin.com/raw/uLXs79VX";
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    function parseValues(csv) {
+        const map = {};
+        for (const line of csv.split("\n")) {
+            const parts = line.split(",").map(s => s.trim());
+            if (parts.length >= 2) {
+                map[parts[0].toLowerCase()] = {
+                    value:  parts[1] || "N/A",
+                    demand: parts[2] || "N/A",
+                    trend:  parts[3] || "N/A",
+                };
+            }
+        }
+        return map;
+    }
+
+    function demandColor(demand) {
+        switch ((demand || "").toLowerCase()) {
+            case "high":   return "#4caf50";
+            case "medium": case "med": case "mid": return "#ff9800";
+            case "low":    return "#f44336";
+            default:       return "#888";
+        }
+    }
+
+    function trendColor(trend) {
+        switch ((trend || "").toLowerCase()) {
+            case "rising":      return "#4caf50";
+            case "stable":      return "#2196f3";
+            case "dropping": case "falling": case "fluctuating": return "#f44336";
+            default:            return "#888";
+        }
+    }
+
+    function waitForElement(selector, callback) {
+        if (document.querySelector(selector)) { callback(); return; }
+        const observer = new MutationObserver(() => {
+            if (document.querySelector(selector)) {
+                observer.disconnect();
+                callback();
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // ── CATALOG PAGE ──────────────────────────────────────────────────────────
+
+    function injectValueBox(valueData) {
+        if (document.getElementById("caelus-value-box")) return;
+        const itemName = (document.querySelector("h1, h2") || {}).innerText?.trim();
+        if (!itemName) return;
+        const priceEl = document.querySelector("[class*='amount-']");
+        if (!priceEl) return;
+        const container = priceEl.closest("p, div");
+        if (!container || !container.parentElement) return;
+        const entry = valueData[itemName.toLowerCase()];
+        const box = document.createElement("div");
+        box.id = "caelus-value-box";
+        box.style.cssText = `background:#e1e1e1;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:sans-serif;font-size:13px;color:#1a1a1a;`;
+        if (entry) {
+            box.innerHTML = `
+                <div style="font-weight:700;font-size:14px;margin-bottom:6px;color:#1a1a1a;">Value Info</div>
+                <div style="display:flex;gap:16px;flex-wrap:wrap;">
+                    <div><span style="color:#444;">Value</span><br><span style="font-weight:600;color:${demandColor(entry.demand)};">R$ ${Number(entry.value).toLocaleString()}</span></div>
+                    <div><span style="color:#444;">Demand</span><br><span style="font-weight:600;color:${demandColor(entry.demand)};">${entry.demand}</span></div>
+                    <div><span style="color:#444;">Trend</span><br><span style="font-weight:600;color:${trendColor(entry.trend)};">${entry.trend}</span></div>
+                </div>`;
+        } else {
+            box.innerHTML = `<div style="font-weight:700;font-size:14px;margin-bottom:4px;color:#1a1a1a;">Value Info</div><div style="color:#444;">No value data for <em>${itemName}</em></div>`;
+        }
+        container.parentElement.insertBefore(box, container);
+    }
+
+    // ── TRADE PAGE ────────────────────────────────────────────────────────────
+
+    function getSlotTotals(slotRow, valueData) {
+        let totalValue = 0;
+        slotRow.querySelectorAll("img[alt]").forEach(img => {
+            const name = img.getAttribute("alt").trim();
+            if (!name || img.src.includes("empty.png")) return;
+            const entry = valueData[name.toLowerCase()];
+            if (entry) totalValue += parseInt(entry.value) || 0;
+        });
+        return { totalValue };
+    }
+
+    function createCalcBox() {
+        const box = document.createElement("div");
+        box.id = "caelus-calc";
+        box.style.cssText = `
+            background: #1a1a1a;
+            border-radius: 8px;
+            padding: 8px 14px;
+            font-family: sans-serif;
+            font-size: 12px;
+            color: #fff;
+            margin: 4px 0;
+            text-align: center;
+        `;
+        box.innerHTML = `
+            <div style="font-weight:700;font-size:10px;color:#aaa;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px;">Value</div>
+            <div id="calc-value-row" style="font-size:14px;font-weight:700;margin-bottom:8px;">
+                <span id="calc-offer-value" style="color:#4caf50;">0</span>
+                <span style="color:#555;margin:0 6px;">vs</span>
+                <span id="calc-request-value" style="color:#f44336;">0</span>
+            </div>
+            <div style="font-weight:700;font-size:10px;color:#aaa;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px;">RAP</div>
+            <div id="calc-rap-row" style="font-size:14px;font-weight:700;">
+                <span id="calc-offer-rap" style="color:#4caf50;">0</span>
+                <span style="color:#555;margin:0 6px;">vs</span>
+                <span id="calc-request-rap" style="color:#f44336;">0</span>
+            </div>
+        `;
+
+        // Remove divider bar and replace for calculator
+        const divider = document.querySelector("[class*='divider-top']");
+        if (divider) {
+            const dividerRow = divider.closest(".row");
+            dividerRow.replaceWith(box);
+        } else {
+            document.body.appendChild(box);
+        }
+        return box;
+    }
+
+    function updateCalculators(valueData) {
+        const card = document.querySelector("[class*='offerRequestCard-']");
+        if (!card) return;
+
+        const slotRows = Array.from(card.querySelectorAll("[class*='row-0-2-']"));
+        if (slotRows.length < 2) return;
+
+        let box = document.getElementById("caelus-calc");
+        if (!box) box = createCalcBox();
+
+        // Calculate value from items in each slot row
+        const offer   = getSlotTotals(slotRows[0], valueData);
+        const request = getSlotTotals(slotRows[1], valueData);
+
+        // RAP — read directly from the site's existing "Value: R$X" spans
+        // The card has two valueText sections — first is offer, second is request
+        const rapSpans = card.querySelectorAll("[class*='valueText-'] [class*='amount-']");
+        const offerRap   = rapSpans[0] ? parseInt(rapSpans[0].innerText.replace(/,/g, "")) || 0 : 0;
+        const requestRap = rapSpans[1] ? parseInt(rapSpans[1].innerText.replace(/,/g, "")) || 0 : 0;
+
+        document.getElementById("calc-offer-value").innerText   = offer.totalValue.toLocaleString();
+        document.getElementById("calc-request-value").innerText = request.totalValue.toLocaleString();
+        document.getElementById("calc-offer-rap").innerText     = offerRap.toLocaleString();
+        document.getElementById("calc-request-rap").innerText   = requestRap.toLocaleString();
+    }
+
+    function labelInventoryItems(valueData) {
+        document.querySelectorAll("[class*='itemCard-']").forEach(card => {
+            if (card.dataset.valueLabeled) return;
+            const a = card.querySelector("a[href*='/catalog/']");
+            if (!a) return;
+            const name = a.innerText.trim();
+            const entry = valueData[name.toLowerCase()];
+            card.dataset.valueLabeled = "1";
+            if (!entry) return;
+            const tag = document.createElement("div");
+            tag.style.cssText = `font-size:11px;font-weight:600;color:${demandColor(entry.demand)};text-align:center;margin-top:2px;`;
+            tag.innerText = `R$ ${Number(entry.value).toLocaleString()}`;
+            const p = a.closest("p");
+            if (p) p.after(tag);
+        });
+    }
+
+    function initTrade(valueData) {
+        labelInventoryItems(valueData);
+        updateCalculators(valueData);
+
+        let debounceTimer = null;
+        const observer = new MutationObserver(() => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                labelInventoryItems(valueData);
+                updateCalculators(valueData);
+            }, 300);
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // ── ROUTER ────────────────────────────────────────────────────────────────
+
+    function start() {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: PASTEBIN_URL,
+            onload: function (res) {
+                const valueData = parseValues(res.responseText);
+                if (window.location.href.includes("/catalog/")) {
+                    waitForElement("[class*='amount-']", () => injectValueBox(valueData));
+                } else if (window.location.href.includes("/trade/")) {
+                    waitForElement("[class*='offerRequestCard-']", () => initTrade(valueData));
+                }
+            },
+            onerror: () => console.error("[Caelus Values] Failed to fetch value list.")
+        });
+    }
+
+    if (document.readyState === "complete") {
+        start();
+    } else {
+        window.addEventListener("load", start);
+    }
+
+})();
