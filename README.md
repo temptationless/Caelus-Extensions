@@ -1,3 +1,3 @@
 # Caelus Extensions
 
-A collection of extensions, modifications, and utilities for Caelus, a Roblox revival project.
+A collection of extensions made by [czy]([https://example.com](https://www.caelus.lol/users/3478/profile))
