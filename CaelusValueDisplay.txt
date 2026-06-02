@@ -1,32 +1,39 @@
 // ==UserScript==
 // @name         Caelus Value Display
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      1.2
 // @description  Shows item value, demand, and trend on Caelus item and trade pages
-// @author       dax
+// @author       dax / czy
 // @match        https://www.caelus.lol/catalog/*
 // @match        https://www.caelus.lol/trade/*
+// @match        https://www.caelus.lol/internal/limiteds*
+// @match        https://www.caelus.lol/trades*
+// @match        https://www.caelus.lol/users/*/profile*
 // @grant        GM_xmlhttpRequest
-// @connect      pastebin.com
+// @connect      raw.githubusercontent.com
+// @downloadURL https://update.greasyfork.org/scripts/580790/Caelus%20Value%20Display.user.js
+// @updateURL https://update.greasyfork.org/scripts/580790/Caelus%20Value%20Display.meta.js
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const PASTEBIN_URL = "https://pastebin.com/raw/uLXs79VX";
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    const VALUE_LIST_URL = "https://raw.githubusercontent.com/temptationless/Caelus-Extensions/refs/heads/main/valuelist";
 
     function parseValues(csv) {
         const map = {};
         for (const line of csv.split("\n")) {
             const parts = line.split(",").map(s => s.trim());
             if (parts.length >= 2) {
-                map[parts[0].toLowerCase()] = {
+                const rawName = parts[0];
+                const cleanedName = rawName.replace(/^[):>\s]+/, "").trim();
+                const entry = {
                     value:  parts[1] || "N/A",
                     demand: parts[2] || "N/A",
                     trend:  parts[3] || "N/A",
                 };
+                map[rawName.toLowerCase()] = entry;
+                map[cleanedName.toLowerCase()] = entry;
             }
         }
         return map;
@@ -61,8 +68,6 @@
         observer.observe(document.body, { childList: true, subtree: true });
     }
 
-    // ── CATALOG PAGE ──────────────────────────────────────────────────────────
-
     function injectValueBox(valueData) {
         if (document.getElementById("caelus-value-box")) return;
         const itemName = (document.querySelector("h1, h2") || {}).innerText?.trim();
@@ -88,8 +93,6 @@
         }
         container.parentElement.insertBefore(box, container);
     }
-
-    // ── TRADE PAGE ────────────────────────────────────────────────────────────
 
     function getSlotTotals(slotRow, valueData) {
         let totalValue = 0;
@@ -117,20 +120,13 @@
         `;
         box.innerHTML = `
             <div style="font-weight:700;font-size:10px;color:#aaa;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px;">Value</div>
-            <div id="calc-value-row" style="font-size:14px;font-weight:700;margin-bottom:8px;">
+            <div id="calc-value-row" style="font-size:14px;font-weight:700;">
                 <span id="calc-offer-value" style="color:#4caf50;">0</span>
                 <span style="color:#555;margin:0 6px;">vs</span>
                 <span id="calc-request-value" style="color:#f44336;">0</span>
             </div>
-            <div style="font-weight:700;font-size:10px;color:#aaa;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px;">RAP</div>
-            <div id="calc-rap-row" style="font-size:14px;font-weight:700;">
-                <span id="calc-offer-rap" style="color:#4caf50;">0</span>
-                <span style="color:#555;margin:0 6px;">vs</span>
-                <span id="calc-request-rap" style="color:#f44336;">0</span>
-            </div>
         `;
 
-        // Remove divider bar and replace for calculator
         const divider = document.querySelector("[class*='divider-top']");
         if (divider) {
             const dividerRow = divider.closest(".row");
@@ -151,20 +147,11 @@
         let box = document.getElementById("caelus-calc");
         if (!box) box = createCalcBox();
 
-        // Calculate value from items in each slot row
         const offer   = getSlotTotals(slotRows[0], valueData);
         const request = getSlotTotals(slotRows[1], valueData);
 
-        // RAP — read directly from the site's existing "Value: R$X" spans
-        // The card has two valueText sections — first is offer, second is request
-        const rapSpans = card.querySelectorAll("[class*='valueText-'] [class*='amount-']");
-        const offerRap   = rapSpans[0] ? parseInt(rapSpans[0].innerText.replace(/,/g, "")) || 0 : 0;
-        const requestRap = rapSpans[1] ? parseInt(rapSpans[1].innerText.replace(/,/g, "")) || 0 : 0;
-
         document.getElementById("calc-offer-value").innerText   = offer.totalValue.toLocaleString();
         document.getElementById("calc-request-value").innerText = request.totalValue.toLocaleString();
-        document.getElementById("calc-offer-rap").innerText     = offerRap.toLocaleString();
-        document.getElementById("calc-request-rap").innerText   = requestRap.toLocaleString();
     }
 
     function labelInventoryItems(valueData) {
@@ -184,9 +171,16 @@
         });
     }
 
+    function renameValueToRap() {
+        document.querySelectorAll("[class*='valueText-'] .pe-2").forEach(span => {
+            if (span.innerText.trim() === "Value:") span.innerText = "RAP:";
+        });
+    }
+
     function initTrade(valueData) {
         labelInventoryItems(valueData);
         updateCalculators(valueData);
+        renameValueToRap();
 
         let debounceTimer = null;
         const observer = new MutationObserver(() => {
@@ -194,23 +188,230 @@
             debounceTimer = setTimeout(() => {
                 labelInventoryItems(valueData);
                 updateCalculators(valueData);
+                renameValueToRap();
             }, 300);
         });
         observer.observe(document.body, { childList: true, subtree: true });
     }
 
-    // ── ROUTER ────────────────────────────────────────────────────────────────
+    function cleanName(raw) {
+        return raw.replace(/^[):>\s]+/, "").trim();
+    }
+
+    function initLimiteds(valueData) {
+        let totalValue = 0;
+
+        document.querySelectorAll("p.mb-0.fw-bolder").forEach(p => {
+            if (p.dataset.valueLabeled) return;
+            p.dataset.valueLabeled = "1";
+
+            const raw = p.innerText.trim();
+            const name = cleanName(raw);
+            const entry = valueData[name.toLowerCase()];
+            if (!entry) return;
+
+            const val = parseInt(entry.value) || 0;
+            totalValue += val;
+
+            const tag = document.createElement("p");
+            tag.style.cssText = `margin:0;font-size:11px;font-weight:600;color:${demandColor(entry.demand)};`;
+            tag.innerText = `Value: R$ ${val.toLocaleString()}`;
+            p.after(tag);
+        });
+
+        if (document.getElementById("caelus-total-value")) return;
+        const rapEl = document.querySelector("p.rap");
+        if (!rapEl) return;
+
+        const totalEl = document.createElement("p");
+        totalEl.id = "caelus-total-value";
+        totalEl.style.cssText = `margin:0;font-weight:600;color:#4caf50;`;
+        totalEl.innerHTML = `Total Value: <span class="fw-bold">R$ ${totalValue.toLocaleString()}</span>`;
+        rapEl.after(totalEl);
+    }
+
+    function initTrades(valueData) {
+        let debounce = null;
+
+        function processDetails() {
+            document.querySelectorAll("[class*='innerSection-']").forEach(panel => {
+                if (panel.dataset.valueProcessed) return;
+                panel.dataset.valueProcessed = "1";
+
+                const sections = panel.querySelectorAll(".row");
+                let giveItems = [];
+                let receiveItems = [];
+                let currentSection = null;
+
+                const allItemCols = Array.from(panel.querySelectorAll("[class*='col-0-2-']"));
+                const half = Math.ceil(allItemCols.length / 2);
+                allItemCols.forEach((col, idx) => {
+                    const a = col.querySelector("a[href*='/catalog/']");
+                    const img = col.querySelector("img[class*='image-']");
+                    if (!a && !img) return;
+                    const name = cleanName((img?.getAttribute("alt") || a?.innerText || "").trim());
+                    if (!name) return;
+                    if (idx < half) giveItems.push(name);
+                    else receiveItems.push(name);
+                });
+
+                let giveValue = 0, receiveValue = 0;
+                giveItems.forEach(name => {
+                    const entry = valueData[name.toLowerCase()];
+                    if (entry) giveValue += parseInt(entry.value) || 0;
+                });
+                receiveItems.forEach(name => {
+                    const entry = valueData[name.toLowerCase()];
+                    if (entry) receiveValue += parseInt(entry.value) || 0;
+                });
+
+                panel.querySelectorAll("[class*='itemName-']").forEach(p => {
+                    if (p.dataset.valueLabeled) return;
+                    p.dataset.valueLabeled = "1";
+                    const a = p.querySelector("a[href*='/catalog/']");
+                    if (!a) return;
+                    const name = cleanName(a.innerText.trim());
+                    const entry = valueData[name.toLowerCase()];
+                    if (!entry) return;
+                    const tag = document.createElement("p");
+                    tag.style.cssText = `margin:0;font-size:11px;font-weight:600;color:${demandColor(entry.demand)};padding:0 4px;`;
+                    tag.innerText = `R$ ${Number(entry.value).toLocaleString()}`;
+                    p.after(tag);
+                });
+
+                const divider = panel.querySelector(".divider-top");
+
+                const buttonRow = panel.querySelector("button[class*='acceptButton-']")?.closest(".row.mt-4");
+                if (!buttonRow) return;
+
+                const calc = document.createElement("div");
+                calc.style.cssText = `
+                    background:#1a1a1a;
+                    border-radius:8px;
+                    padding:6px 12px;
+                    font-family:sans-serif;
+                    font-size:12px;
+                    color:#fff;
+                    display:inline-block;
+                    margin-right: 10px;
+                    vertical-align:middle;
+                `;
+                calc.innerHTML = `
+                    <div style="font-weight:700;font-size:10px;color:#aaa;margin-bottom:2px;text-transform:uppercase;letter-spacing:1px;">Value</div>
+                    <div style="font-size:14px;font-weight:700;">
+                        <span style="color:#4caf50;">${giveValue.toLocaleString()}</span>
+                        <span style="color:#555;margin:0 5px;">vs</span>
+                        <span style="color:#f44336;">${receiveValue.toLocaleString()}</span>
+                    </div>
+                `;
+
+                const col = document.createElement("div");
+                col.className = "col-3";
+                col.style.cssText = "display:flex;align-items:center;";
+                col.appendChild(calc);
+
+                const offsetCol = buttonRow.querySelector(".offset-2");
+                if (offsetCol) {
+                    offsetCol.classList.remove("offset-2");
+                    offsetCol.classList.add("col-7");
+                }
+                buttonRow.querySelector(".row.mx-auto")?.closest(".col-8")?.before(col);
+            });
+        }
+
+        processDetails();
+        const observer = new MutationObserver(() => {
+            clearTimeout(debounce);
+            debounce = setTimeout(processDetails, 300);
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function initProfile(valueData) {
+        const match = window.location.href.match(/\/users\/(\d+)\//);
+        if (!match) return;
+        const userId = match[1];
+
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: `https://www.caelus.lol/internal/limiteds?userId=${userId}`,
+            onload: function(res) {
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(res.responseText, "text/html");
+
+                const rapEl = doc.querySelector("p.rap span.fw-bold");
+                const rap = rapEl ? rapEl.innerText.trim() : "0";
+
+                let totalValue = 0;
+                doc.querySelectorAll("p.mb-0.fw-bolder").forEach(p => {
+                    const name = cleanName(p.innerText.trim());
+                    const entry = valueData[name.toLowerCase()];
+                    if (entry) totalValue += parseInt(entry.value) || 0;
+                });
+
+                if (document.getElementById("caelus-profile-stats")) return;
+
+                const usernameEl = document.querySelector("h2[class*='username-']");
+                if (!usernameEl) return;
+
+                let targetEl = null;
+                let sibling = usernameEl.nextElementSibling;
+                while (sibling) {
+                    if (sibling.tagName === "P" && sibling.innerHTML.includes("&emsp;") || sibling.innerText.trim() === "") {
+                        targetEl = sibling;
+                        break;
+                    }
+                    sibling = sibling.nextElementSibling;
+                }
+
+                const statsBox = document.createElement("div");
+                statsBox.id = "caelus-profile-stats";
+                statsBox.style.cssText = `display:flex;gap:16px;font-family:sans-serif;`;
+                statsBox.innerHTML = `
+                    <div style="text-align:center;">
+                        <p style="margin:0;font-size:16px;font-weight:700;color:#2196f3;">${Number(rap.replace(/,/g,'')).toLocaleString()}</p>
+                        <p style="margin:0;font-size:12px;color:#888;">RAP</p>
+                    </div>
+                    <div style="text-align:center;">
+                        <p style="margin:0;font-size:16px;font-weight:700;color:#4caf50;">${totalValue.toLocaleString()}</p>
+                        <p style="margin:0;font-size:12px;color:#888;">Value</p>
+                    </div>
+                `;
+
+                if (targetEl) {
+                    targetEl.replaceWith(statsBox);
+                } else {
+                    usernameEl.after(statsBox);
+                }
+            },
+            onerror: () => console.error("[Caelus Values] Failed to fetch limiteds for user " + userId)
+        });
+    }
 
     function start() {
         GM_xmlhttpRequest({
             method: "GET",
-            url: PASTEBIN_URL,
+            url: VALUE_LIST_URL,
             onload: function (res) {
                 const valueData = parseValues(res.responseText);
                 if (window.location.href.includes("/catalog/")) {
                     waitForElement("[class*='amount-']", () => injectValueBox(valueData));
                 } else if (window.location.href.includes("/trade/")) {
                     waitForElement("[class*='offerRequestCard-']", () => initTrade(valueData));
+                } else if (window.location.href.includes("/users/") && window.location.href.includes("/profile")) {
+                    waitForElement("[class*='username-']", () => initProfile(valueData));
+                } else if (window.location.href.includes("/trades")) {
+                    waitForElement("table", () => initTrades(valueData));
+                } else if (window.location.href.includes("/internal/limiteds")) {
+                    waitForElement("p.mb-0.fw-bolder", () => {
+                        initLimiteds(valueData);
+                        let t = null;
+                        const obs = new MutationObserver(() => {
+                            clearTimeout(t);
+                            t = setTimeout(() => initLimiteds(valueData), 300);
+                        });
+                        obs.observe(document.body, { childList: true, subtree: true });
+                    });
                 }
             },
             onerror: () => console.error("[Caelus Values] Failed to fetch value list.")
