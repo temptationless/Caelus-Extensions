@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caelus Value Display
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Shows item value, demand, and trend on Caelus item and trade pages
 // @author       dax / czy
 // @match        https://www.caelus.lol/catalog/*
@@ -10,7 +10,7 @@
 // @match        https://www.caelus.lol/trades*
 // @match        https://www.caelus.lol/users/*/profile*
 // @grant        GM_xmlhttpRequest
-// @connect      raw.githubusercontent.com
+// @connect      colimons.xyz
 // @downloadURL https://update.greasyfork.org/scripts/580790/Caelus%20Value%20Display.user.js
 // @updateURL https://update.greasyfork.org/scripts/580790/Caelus%20Value%20Display.meta.js
 // ==/UserScript==
@@ -18,7 +18,7 @@
 (function () {
     'use strict';
 
-    const VALUE_LIST_URL = "https://raw.githubusercontent.com/temptationless/Caelus-Extensions/refs/heads/main/valuelist";
+    const VALUE_LIST_URL = "https://colimons.xyz/api/valuelist";
 
     function parseValues(csv) {
         const map = {};
