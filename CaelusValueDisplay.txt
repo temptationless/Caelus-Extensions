@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Caelus Value Display
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      67
 // @description  Shows item value, demand, and trend on Caelus item and trade pages
 // @author       dax / czy
 // @match        https://www.caelus.lol/catalog/*
@@ -24,19 +24,54 @@
         const map = {};
         for (const line of csv.split("\n")) {
             const parts = line.split(",").map(s => s.trim());
-            if (parts.length >= 2) {
-                const rawName = parts[0];
-                const cleanedName = rawName.replace(/^[):>\s]+/, "").trim();
-                const entry = {
-                    value:  parts[1] || "N/A",
-                    demand: parts[2] || "N/A",
-                    trend:  parts[3] || "N/A",
-                };
-                map[rawName.toLowerCase()] = entry;
-                map[cleanedName.toLowerCase()] = entry;
-            }
+            if (parts.length < 4 || !/^\d+$/.test(parts[0])) continue;
+            map[parts[0]] = {
+                value:  parts[1] || "0",
+                demand: parts[2] || "N/A",
+                trend:  parts[3] || "N/A",
+            };
         }
         return map;
+    }
+
+    function assetIdFromHref(href) {
+        const m = (href || "").match(/\/catalog\/(\d+)/);
+        return m ? m[1] : null;
+    }
+
+    function findAssetIdNear(node) {
+        let el = node;
+        for (let i = 0; i < 6 && el; i++) {
+            const a = el.matches && el.matches('a[href*="/catalog/"]') ? el : el.querySelector && el.querySelector('a[href*="/catalog/"]');
+            if (a) return assetIdFromHref(a.getAttribute("href"));
+            el = el.parentElement;
+        }
+        return null;
+    }
+
+    const rapCache = new Map();
+    function fetchRap(assetId) {
+        if (rapCache.has(assetId)) return Promise.resolve(rapCache.get(assetId));
+        return fetch(`https://www.caelus.lol/apisite/economy/v1/assets/${assetId}/resale-data`)
+            .then(res => (res.ok ? res.json() : null))
+            .then(data => {
+                const rap = (data && Number(data.recentAveragePrice)) || 0;
+                rapCache.set(assetId, rap);
+                return rap;
+            })
+            .catch(() => {
+                rapCache.set(assetId, 0);
+                return 0;
+            });
+    }
+
+    async function sumValueOrRap(assetIds, valueData) {
+        const amounts = await Promise.all(assetIds.map(async (assetId) => {
+            const entry = valueData[assetId];
+            const val = entry ? parseInt(entry.value) || 0 : 0;
+            return val > 0 ? val : fetchRap(assetId);
+        }));
+        return amounts.reduce((sum, n) => sum + n, 0);
     }
 
     function demandColor(demand) {
@@ -72,11 +107,12 @@
         if (document.getElementById("caelus-value-box")) return;
         const itemName = (document.querySelector("h1, h2") || {}).innerText?.trim();
         if (!itemName) return;
+        const assetId = assetIdFromHref(window.location.pathname);
         const priceEl = document.querySelector("[class*='amount-']");
         if (!priceEl) return;
         const container = priceEl.closest("p, div");
         if (!container || !container.parentElement) return;
-        const entry = valueData[itemName.toLowerCase()];
+        const entry = assetId ? valueData[assetId] : null;
         const box = document.createElement("div");
         box.id = "caelus-value-box";
         box.style.cssText = `background:#e1e1e1;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:sans-serif;font-size:13px;color:#1a1a1a;`;
@@ -94,13 +130,53 @@
         container.parentElement.insertBefore(box, container);
     }
 
-    function getSlotTotals(slotRow, valueData) {
+    async function fetchJson(url) {
+        const res = await fetch(url, { credentials: "include" });
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+        return res.json();
+    }
+
+    async function fetchFullInventory(userId) {
+        const collected = [];
+        let cursor = "";
+        for (let i = 0; i < 50; i++) {
+            const data = await fetchJson(`https://www.caelus.lol/apisite/inventory/v1/users/${userId}/assets/collectibles?cursor=${encodeURIComponent(cursor)}&limit=100&assetType=null`);
+            collected.push(...((data && data.data) || []));
+            if (!data || !data.nextPageCursor || collected.length >= 2000) break;
+            cursor = data.nextPageCursor;
+        }
+        return collected;
+    }
+
+    async function buildSlotItemMap() {
+        const map = new Map();
+        try {
+            const params = new URLSearchParams(window.location.search);
+            const partnerId = params.get("TradePartnerID");
+            const me = await fetchJson("https://www.caelus.lol/apisite/users/v1/users/authenticated");
+            const userIds = [me.id, partnerId].filter(Boolean);
+            const inventories = await Promise.all(userIds.map(fetchFullInventory));
+            inventories.flat().forEach(item => {
+                if (item && item.name) {
+                    map.set(item.name, { assetId: String(item.assetId), rap: Number(item.recentAveragePrice) || 0 });
+                }
+            });
+        } catch (err) {
+            console.error("[Caelus Values] Failed to build slot item map", err);
+        }
+        return map;
+    }
+
+    function getSlotTotals(slotRow, valueData, itemMap) {
         let totalValue = 0;
         slotRow.querySelectorAll("img[alt]").forEach(img => {
-            const name = img.getAttribute("alt").trim();
-            if (!name || img.src.includes("empty.png")) return;
-            const entry = valueData[name.toLowerCase()];
-            if (entry) totalValue += parseInt(entry.value) || 0;
+            const alt = img.getAttribute("alt").trim();
+            if (!alt || img.src.includes("empty.png")) return;
+            const info = itemMap.get(alt);
+            if (!info) return;
+            const entry = valueData[info.assetId];
+            const val = entry ? parseInt(entry.value) || 0 : 0;
+            totalValue += val > 0 ? val : info.rap;
         });
         return { totalValue };
     }
@@ -137,7 +213,7 @@
         return box;
     }
 
-    function updateCalculators(valueData) {
+    function updateCalculators(valueData, itemMap) {
         const card = document.querySelector("[class*='offerRequestCard-']");
         if (!card) return;
 
@@ -147,11 +223,13 @@
         let box = document.getElementById("caelus-calc");
         if (!box) box = createCalcBox();
 
-        const offer   = getSlotTotals(slotRows[0], valueData);
-        const request = getSlotTotals(slotRows[1], valueData);
+        const offer = getSlotTotals(slotRows[0], valueData, itemMap);
+        const request = getSlotTotals(slotRows[1], valueData, itemMap);
 
-        document.getElementById("calc-offer-value").innerText   = offer.totalValue.toLocaleString();
-        document.getElementById("calc-request-value").innerText = request.totalValue.toLocaleString();
+        const offerEl = document.getElementById("calc-offer-value");
+        const requestEl = document.getElementById("calc-request-value");
+        if (offerEl) offerEl.innerText = offer.totalValue.toLocaleString();
+        if (requestEl) requestEl.innerText = request.totalValue.toLocaleString();
     }
 
     function labelInventoryItems(valueData) {
@@ -159,9 +237,10 @@
             if (card.dataset.valueLabeled) return;
             const a = card.querySelector("a[href*='/catalog/']");
             if (!a) return;
-            const name = a.innerText.trim();
-            const entry = valueData[name.toLowerCase()];
+            const assetId = assetIdFromHref(a.getAttribute("href"));
             card.dataset.valueLabeled = "1";
+            if (!assetId) return;
+            const entry = valueData[assetId];
             if (!entry) return;
             const tag = document.createElement("div");
             tag.style.cssText = `font-size:11px;font-weight:600;color:${demandColor(entry.demand)};text-align:center;margin-top:2px;`;
@@ -178,8 +257,14 @@
     }
 
     function initTrade(valueData) {
+        let itemMap = new Map();
+        buildSlotItemMap().then(map => {
+            itemMap = map;
+            updateCalculators(valueData, itemMap);
+        });
+
         labelInventoryItems(valueData);
-        updateCalculators(valueData);
+        updateCalculators(valueData, itemMap);
         renameValueToRap();
 
         let debounceTimer = null;
@@ -187,15 +272,11 @@
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => {
                 labelInventoryItems(valueData);
-                updateCalculators(valueData);
+                updateCalculators(valueData, itemMap);
                 renameValueToRap();
             }, 300);
         });
         observer.observe(document.body, { childList: true, subtree: true });
-    }
-
-    function cleanName(raw) {
-        return raw.replace(/^[):>\s]+/, "").trim();
     }
 
     function initLimiteds(valueData) {
@@ -205,9 +286,8 @@
             if (p.dataset.valueLabeled) return;
             p.dataset.valueLabeled = "1";
 
-            const raw = p.innerText.trim();
-            const name = cleanName(raw);
-            const entry = valueData[name.toLowerCase()];
+            const assetId = findAssetIdNear(p);
+            const entry = assetId ? valueData[assetId] : null;
             if (!entry) return;
 
             const val = parseInt(entry.value) || 0;
@@ -233,15 +313,15 @@
     function initTrades(valueData) {
         let debounce = null;
 
-        function processDetails() {
-            document.querySelectorAll("[class*='innerSection-']").forEach(panel => {
-                if (panel.dataset.valueProcessed) return;
+        async function processDetails() {
+            const panels = Array.from(document.querySelectorAll("[class*='innerSection-']"))
+                .filter(panel => !panel.dataset.valueProcessed);
+
+            for (const panel of panels) {
                 panel.dataset.valueProcessed = "1";
 
-                const sections = panel.querySelectorAll(".row");
-                let giveItems = [];
-                let receiveItems = [];
-                let currentSection = null;
+                let giveIds = [];
+                let receiveIds = [];
 
                 const allItemCols = Array.from(panel.querySelectorAll("[class*='col-0-2-']"));
                 const half = Math.ceil(allItemCols.length / 2);
@@ -249,29 +329,24 @@
                     const a = col.querySelector("a[href*='/catalog/']");
                     const img = col.querySelector("img[class*='image-']");
                     if (!a && !img) return;
-                    const name = cleanName((img?.getAttribute("alt") || a?.innerText || "").trim());
-                    if (!name) return;
-                    if (idx < half) giveItems.push(name);
-                    else receiveItems.push(name);
+                    const assetId = a ? assetIdFromHref(a.getAttribute("href")) : null;
+                    if (!assetId) return;
+                    if (idx < half) giveIds.push(assetId);
+                    else receiveIds.push(assetId);
                 });
 
-                let giveValue = 0, receiveValue = 0;
-                giveItems.forEach(name => {
-                    const entry = valueData[name.toLowerCase()];
-                    if (entry) giveValue += parseInt(entry.value) || 0;
-                });
-                receiveItems.forEach(name => {
-                    const entry = valueData[name.toLowerCase()];
-                    if (entry) receiveValue += parseInt(entry.value) || 0;
-                });
+                const [giveValue, receiveValue] = await Promise.all([
+                    sumValueOrRap(giveIds, valueData),
+                    sumValueOrRap(receiveIds, valueData),
+                ]);
 
                 panel.querySelectorAll("[class*='itemName-']").forEach(p => {
                     if (p.dataset.valueLabeled) return;
                     p.dataset.valueLabeled = "1";
                     const a = p.querySelector("a[href*='/catalog/']");
                     if (!a) return;
-                    const name = cleanName(a.innerText.trim());
-                    const entry = valueData[name.toLowerCase()];
+                    const assetId = assetIdFromHref(a.getAttribute("href"));
+                    const entry = assetId ? valueData[assetId] : null;
                     if (!entry) return;
                     const tag = document.createElement("p");
                     tag.style.cssText = `margin:0;font-size:11px;font-weight:600;color:${demandColor(entry.demand)};padding:0 4px;`;
@@ -279,10 +354,8 @@
                     p.after(tag);
                 });
 
-                const divider = panel.querySelector(".divider-top");
-
                 const buttonRow = panel.querySelector("button[class*='acceptButton-']")?.closest(".row.mt-4");
-                if (!buttonRow) return;
+                if (!buttonRow) continue;
 
                 const calc = document.createElement("div");
                 calc.style.cssText = `
@@ -316,7 +389,7 @@
                     offsetCol.classList.add("col-7");
                 }
                 buttonRow.querySelector(".row.mx-auto")?.closest(".col-8")?.before(col);
-            });
+            }
         }
 
         processDetails();
@@ -327,27 +400,22 @@
         observer.observe(document.body, { childList: true, subtree: true });
     }
 
-    function initProfile(valueData) {
+    function initProfile() {
         const match = window.location.href.match(/\/users\/(\d+)\//);
         if (!match) return;
         const userId = match[1];
 
         GM_xmlhttpRequest({
             method: "GET",
-            url: `https://www.caelus.lol/internal/limiteds?userId=${userId}`,
-            onload: function(res) {
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(res.responseText, "text/html");
-
-                const rapEl = doc.querySelector("p.rap span.fw-bold");
-                const rap = rapEl ? rapEl.innerText.trim() : "0";
-
-                let totalValue = 0;
-                doc.querySelectorAll("p.mb-0.fw-bolder").forEach(p => {
-                    const name = cleanName(p.innerText.trim());
-                    const entry = valueData[name.toLowerCase()];
-                    if (entry) totalValue += parseInt(entry.value) || 0;
-                });
+            url: `https://colimons.xyz/api/players/${userId}/rank`,
+            onload: function (res) {
+                let data;
+                try {
+                    data = JSON.parse(res.responseText);
+                } catch (err) {
+                    console.error("[Caelus Values] Failed to parse rank response for user " + userId, err);
+                    return;
+                }
 
                 if (document.getElementById("caelus-profile-stats")) return;
 
@@ -364,16 +432,19 @@
                     sibling = sibling.nextElementSibling;
                 }
 
+                const rap = Number(data.rap) || 0;
+                const value = Number(data.value) || 0;
+
                 const statsBox = document.createElement("div");
                 statsBox.id = "caelus-profile-stats";
                 statsBox.style.cssText = `display:flex;gap:16px;font-family:sans-serif;`;
                 statsBox.innerHTML = `
                     <div style="text-align:center;">
-                        <p style="margin:0;font-size:16px;font-weight:700;color:#2196f3;">${Number(rap.replace(/,/g,'')).toLocaleString()}</p>
+                        <p style="margin:0;font-size:16px;font-weight:700;color:#2196f3;">${rap.toLocaleString()}</p>
                         <p style="margin:0;font-size:12px;color:#888;">RAP</p>
                     </div>
                     <div style="text-align:center;">
-                        <p style="margin:0;font-size:16px;font-weight:700;color:#4caf50;">${totalValue.toLocaleString()}</p>
+                        <p style="margin:0;font-size:16px;font-weight:700;color:#4caf50;">${value.toLocaleString()}</p>
                         <p style="margin:0;font-size:12px;color:#888;">Value</p>
                     </div>
                 `;
@@ -384,7 +455,7 @@
                     usernameEl.after(statsBox);
                 }
             },
-            onerror: () => console.error("[Caelus Values] Failed to fetch limiteds for user " + userId)
+            onerror: () => console.error("[Caelus Values] Failed to fetch rank for user " + userId)
         });
     }
 
@@ -399,7 +470,7 @@
                 } else if (window.location.href.includes("/trade/")) {
                     waitForElement("[class*='offerRequestCard-']", () => initTrade(valueData));
                 } else if (window.location.href.includes("/users/") && window.location.href.includes("/profile")) {
-                    waitForElement("[class*='username-']", () => initProfile(valueData));
+                    waitForElement("[class*='username-']", initProfile);
                 } else if (window.location.href.includes("/trades")) {
                     waitForElement("table", () => initTrades(valueData));
                 } else if (window.location.href.includes("/internal/limiteds")) {
